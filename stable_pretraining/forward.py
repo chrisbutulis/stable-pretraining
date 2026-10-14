@@ -546,26 +546,26 @@ def _ressl_dequeue_and_enqueue(self, keys):
 def ressl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
     """Forward function for ReSSL.
 
-ReSSL learns representations by matching student and teacher relational
-distributions over a queue of previous teacher projections.
+    ReSSL learns representations by matching student and teacher relational
+    distributions over a queue of previous teacher projections.
 
-Args:
-    self: Module instance with required attributes:
-        - backbone: TeacherStudentWrapper for feature extraction.
-        - projector: TeacherStudentWrapper for projection embeddings.
-        - ressl_loss: ReSSLLoss for relational cross-entropy.
-        - ressl_queue: Module containing the teacher projection queue
-          and its circular queue pointer.
-    batch: Batch containing weak and strong augmented views during
-        training, or a single image during validation and testing.
-    stage: Training stage ("train", "val", or "test").
+    Args:
+        self: Module instance with required attributes:
+            - backbone: TeacherStudentWrapper for feature extraction.
+            - projector: TeacherStudentWrapper for projection embeddings.
+            - ressl_loss: ReSSLLoss for relational cross-entropy.
+            - queue: Buffer containing previous teacher projections.
+            - queue_ptr: Buffer tracking the circular queue position.
+        batch: Batch containing weak and strong augmented views during
+            training, or a single image during validation and testing.
+        stage: Training stage ("train", "val", or "test").
 
-Returns:
-    Dictionary containing:
-        - "embedding": Student backbone representation.
-        - "loss": ReSSL loss during training only.
-        - "label": Ground-truth labels, if present.
-"""
+    Returns:
+        Dictionary containing:
+            - "embedding": Student backbone representation.
+            - "loss": ReSSL loss during training only.
+            - "label": Ground-truth labels, if present.
+    """
     out = {}
     views = _get_views_list(batch)
 
@@ -576,27 +576,17 @@ Returns:
             )
 
         weak_view = views[0]["image"]
-        contrastive_view = views[1]["image"]
+        strong_view = views[1]["image"]
 
         if "label" in views[0]:
             out["label"] = views[0]["label"]
 
-        student_features = self.backbone.forward_student(
-            contrastive_view
-        )
-
-        # Only compute the ReSSL objective during training
+        # Student backbone: strong augmentation
+        student_features = self.backbone.forward_student(strong_view)
         out["embedding"] = student_features.detach()
 
         if stage not in ("train", "fit"):
             return out
-
-        print("Student training:", self.backbone.student.training)
-        print("Teacher training:", self.backbone.teacher.training)
-        print("Student BN training:", self.backbone.student.bn1.training)
-        print("Teacher BN training:", self.backbone.teacher.bn1.training)
-
-        teacher_bn_before = self.backbone.teacher.bn1.running_mean.detach().clone()
 
         # Teacher branch: weak augmentation
         with torch.no_grad():
@@ -604,89 +594,30 @@ Returns:
             teacher_projection = self.projector.forward_teacher(
                 teacher_features
             )
-            teacher_projection = torch.nn.functional.normalize(teacher_projection, dim=-1)
+            teacher_projection = torch.nn.functional.normalize(
+                teacher_projection, dim=-1
+            )
 
-        teacher_bn_after = self.backbone.teacher.bn1.running_mean.detach()
-        print(
-            "Teacher BN running mean change:",
-            (teacher_bn_after - teacher_bn_before).abs().mean().item(),
-        )
-
-        # Student branch: strong / contrastive augmentation
+        # Student branch: strong augmentation
         student_projection = self.projector.forward_student(
             student_features
         )
-        student_projection = torch.nn.functional.normalize(student_projection, dim=-1)
+        student_projection = torch.nn.functional.normalize(
+            student_projection, dim=-1
+        )
+
         # Clone the queue to prevent in-place modification errors
         # during backward propagation.
         queue = self.queue.detach().clone()
 
-        with torch.no_grad():
-            student_backbone = torch.nn.functional.normalize(
-                student_features, dim=-1
-            )
-            teacher_backbone = torch.nn.functional.normalize(
-                teacher_features, dim=-1
-            )
-
-            mask = ~torch.eye(
-                student_backbone.size(0),
-                dtype=torch.bool,
-                device=student_backbone.device,
-            )
-
-            print(
-                "Student backbone similarity:",
-                (student_backbone @ student_backbone.T)[mask].mean().item(),
-            )
-            print(
-                "Teacher backbone similarity:",
-                (teacher_backbone @ teacher_backbone.T)[mask].mean().item(),
-            )
-
-        with torch.no_grad():
-            teacher_logits = teacher_projection @ queue.T
-            teacher_probs = torch.softmax(
-                teacher_logits / self.ressl_loss.temperature_teacher,
-                dim=-1,
-            )
-
-            entropy = -(
-                teacher_probs * teacher_probs.clamp_min(1e-12).log()
-            ).sum(dim=-1).mean()
-
-            print("Teacher entropy:", entropy.item())
-            print("Teacher max probability:", teacher_probs.max(dim=-1).values.mean().item())
-        with torch.no_grad():
-            student_similarity = (
-                student_projection @ student_projection.T
-            )
-            teacher_similarity = (
-                teacher_projection @ teacher_projection.T
-            )
-
-            mask = ~torch.eye(
-                student_similarity.size(0),
-                dtype=torch.bool,
-                device=student_similarity.device,
-            )
-
-            print(
-                "Student pairwise similarity:",
-                student_similarity[mask].mean().item(),
-            )
-            print(
-                "Teacher pairwise similarity:",
-                teacher_similarity[mask].mean().item(),
-            )
-
-        # Compute relational cross-entropy loss
+        # Compute relational cross-entropy loss.
         out["loss"] = self.ressl_loss(
             student_projection,
             teacher_projection,
             queue,
         )
 
+        # Update the queue with the current teacher projections.
         _ressl_dequeue_and_enqueue(
             self,
             teacher_projection.detach(),
@@ -709,9 +640,7 @@ Returns:
             out["label"] = batch["label"]
 
         with torch.no_grad():
-            student_features = self.backbone.forward_student(
-                images
-            )
+            student_features = self.backbone.forward_student(images)
 
         out["embedding"] = student_features.detach()
 

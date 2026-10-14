@@ -16,20 +16,20 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 from utils import get_data_dir
 
+batch_size = 256
+
 ressl_transform = transforms.MultiViewTransform(
     [
         transforms.Compose(
-            transforms.RGB(),
             transforms.RandomResizedCrop((32, 32), scale=(0.2, 1.0)),
-            transforms.RandomHorizontalFlip(p=0.5), 
+            transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToImage(**spt.data.static.CIFAR10),
         ),
         transforms.Compose(
-            transforms.RGB(),
             transforms.RandomResizedCrop((32, 32), scale=(0.2, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(
-                brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1, p=0.8
+                brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8
             ),
             transforms.GaussianBlur(kernel_size=3, p=0.5),
             transforms.ToImage(**spt.data.static.CIFAR10),
@@ -60,8 +60,6 @@ val_dataset = spt.data.FromTorchDataset(
     transform=val_transform,
 )
 
-batch_size = 256
-
 train_dataloader = torch.utils.data.DataLoader(
     dataset=train_dataset,
     batch_size=batch_size,
@@ -75,6 +73,16 @@ val_dataloader = torch.utils.data.DataLoader(
     num_workers=0,
 )
 
+warmup_epochs = 5
+max_epochs = 200
+steps_per_epoch = len(train_dataloader)
+warmup_steps = warmup_epochs * steps_per_epoch
+max_steps = max_epochs * steps_per_epoch
+
+print(f"Steps per epoch: {steps_per_epoch}")
+print(f"Warmup steps: {warmup_steps}")
+print(f"Total steps: {max_steps}")
+
 data = spt.data.DataModule(train=train_dataloader, val=val_dataloader)
 
 base = spt.backbone.from_torchvision(
@@ -86,8 +94,8 @@ base.fc = nn.Identity()
 backbone = spt.TeacherStudentWrapper(
     base,
     warm_init=True,
-    base_ema_coefficient=0.999,
-    final_ema_coefficient=0.999,
+    base_ema_coefficient=0.99,
+    final_ema_coefficient=0.99,
 )
 
 projector = spt.TeacherStudentWrapper(
@@ -97,15 +105,15 @@ projector = spt.TeacherStudentWrapper(
         nn.Linear(4096, 512),
     ),
     warm_init=True,
-    base_ema_coefficient=0.996,
-    final_ema_coefficient=0.996,
+    base_ema_coefficient=0.99,
+    final_ema_coefficient=0.99,
 )
 
 module = spt.Module(
     backbone=backbone,
     projector=projector,
     forward=forward.ressl,
-    ressl_loss=spt.losses.ReSSLLoss(temperature_student=0.1, temperature_teacher=0.04),
+    ressl_loss=spt.losses.ReSSLLoss(temperature_student=0.1, temperature_teacher=0.05),
     queue=torch.nn.functional.normalize(
         torch.randn(4096, 512),
         dim=1,
@@ -114,13 +122,19 @@ module = spt.Module(
     optim={
         "optimizer": {
             "type": "SGD",
+            "exclude_bias_norm": True,
+            "momentum": 0.9,
             "lr": 0.06 * batch_size / 256,
             "weight_decay": 5e-4,
         },
         "scheduler": {
-            "type": "LinearWarmupCosineAnnealing",
+            "type": "LinearWarmupCosineAnnealingLR",
+            "warmup_steps": warmup_steps,
+            "max_steps": max_steps,
+            "warmup_start_lr": 0.0,
+            "eta_min": 0.0,
         },
-        "interval": "epoch",
+        "interval": "step",
     },
 )
 
@@ -167,10 +181,15 @@ wandb_logger = WandbLogger(
     log_model=False,
 )
 
+ema_callback = spt.callbacks.TeacherStudentCallback(
+    update_frequency=1,
+    update_after_backward=False,
+)
+
 trainer = pl.Trainer(
-    max_epochs=10,
+    max_epochs=200,
     num_sanity_val_steps=0,
-    callbacks=[knn_probe, linear_probe],
+    callbacks=[knn_probe, linear_probe, ema_callback],
     precision="32-true",
     logger=wandb_logger,
     enable_checkpointing=False,
