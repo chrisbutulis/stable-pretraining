@@ -535,13 +535,13 @@ def barlow_twins(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Ten
 @torch.no_grad()
 def _ressl_dequeue_and_enqueue(self, keys):
     ptr = int(self.queue_ptr.item())
+    batch_size = keys.shape[0]
     size = self.queue.shape[0]
 
-    for key in keys:
-        self.queue[ptr] = key
-        ptr = (ptr + 1) % size
+    assert size % batch_size == 0
 
-    self.queue_ptr[0] = ptr
+    self.queue[ptr:ptr + batch_size] = keys.detach()
+    self.queue_ptr[0] = (ptr + batch_size) % size
 
 def ressl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
     """Forward function for ReSSL.
@@ -590,13 +590,28 @@ def ressl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
 
         # Teacher branch: weak augmentation
         with torch.no_grad():
-            teacher_features = self.backbone.forward_teacher(weak_view)
+            # Shuffle teacher images before SplitBatchNorm
+            idx_shuffle = torch.randperm(
+                weak_view.shape[0],
+                device=weak_view.device,
+            )
+            idx_unshuffle = torch.argsort(idx_shuffle)
+
+            shuffled_weak_view = weak_view[idx_shuffle]
+
+            teacher_features = self.backbone.forward_teacher(
+                shuffled_weak_view
+            )
             teacher_projection = self.projector.forward_teacher(
                 teacher_features
             )
             teacher_projection = torch.nn.functional.normalize(
-                teacher_projection, dim=-1
+                teacher_projection,
+                dim=-1,
             )
+
+            # Restore original order before calculating loss
+            teacher_projection = teacher_projection[idx_unshuffle]
 
         # Student branch: strong augmentation
         student_projection = self.projector.forward_student(

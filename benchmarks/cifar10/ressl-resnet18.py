@@ -6,6 +6,7 @@ import torch.nn as nn
 import torchmetrics
 import torchvision
 from lightning.pytorch.loggers import WandbLogger
+from stable_pretraining.backbone.split_batchnorm import SplitBatchNorm
 
 import stable_pretraining as spt
 from stable_pretraining import forward
@@ -16,31 +17,56 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 from utils import get_data_dir
 
+cifar10_stats = {
+    "mean": [0.4914, 0.4822, 0.4465],
+    "std": [0.2023, 0.1994, 0.2010],
+}
+
 batch_size = 256
+
+def replace_batchnorm(module, num_splits=8):
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            replacement = SplitBatchNorm(
+                child.num_features,
+                num_splits=num_splits,
+                eps=child.eps,
+                momentum=child.momentum,
+                affine=child.affine,
+                track_running_stats=child.track_running_stats,
+            )
+            replacement.load_state_dict(child.state_dict())
+            setattr(module, name, replacement)
+        else:
+            replace_batchnorm(child, num_splits)
 
 ressl_transform = transforms.MultiViewTransform(
     [
         transforms.Compose(
             transforms.RandomResizedCrop((32, 32), scale=(0.2, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToImage(**spt.data.static.CIFAR10),
+            transforms.ToImage(**cifar10_stats),
         ),
         transforms.Compose(
             transforms.RandomResizedCrop((32, 32), scale=(0.2, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomGrayscale(p=0.2),
             transforms.ColorJitter(
                 brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8
             ),
-            transforms.GaussianBlur(kernel_size=3, p=0.5),
-            transforms.ToImage(**spt.data.static.CIFAR10),
+            transforms.GaussianBlur(
+                kernel_size=9,
+                sigma=(0.1, 2.0),
+                p=0.5,
+            ),
+            transforms.ToImage(**cifar10_stats),
         ),
     ]
 )
 
 val_transform = transforms.Compose(
     transforms.RGB(),
-    transforms.Resize((32, 32)),
-    transforms.ToImage(**spt.data.static.CIFAR10),
+    transforms.ToImage(**cifar10_stats),
 )
 
 data_dir = get_data_dir("cifar10")
@@ -91,6 +117,8 @@ base = spt.backbone.from_torchvision(
 )
 base.fc = nn.Identity()
 
+replace_batchnorm(base, num_splits=8)
+
 backbone = spt.TeacherStudentWrapper(
     base,
     warm_init=True,
@@ -100,9 +128,9 @@ backbone = spt.TeacherStudentWrapper(
 
 projector = spt.TeacherStudentWrapper(
     nn.Sequential(
-        nn.Linear(512, 4096),
+        nn.Linear(512, 2048),
         nn.ReLU(inplace=True),
-        nn.Linear(4096, 512),
+        nn.Linear(2048, 128),
     ),
     warm_init=True,
     base_ema_coefficient=0.99,
@@ -113,9 +141,9 @@ module = spt.Module(
     backbone=backbone,
     projector=projector,
     forward=forward.ressl,
-    ressl_loss=spt.losses.ReSSLLoss(temperature_student=0.1, temperature_teacher=0.05),
+    ressl_loss=spt.losses.ReSSLLoss(temperature_student=0.1, temperature_teacher=0.04),
     queue=torch.nn.functional.normalize(
-        torch.randn(4096, 512),
+        torch.randn(4096, 128),
         dim=1,
     ),
     queue_ptr=torch.zeros(1, dtype=torch.long),
