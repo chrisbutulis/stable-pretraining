@@ -532,133 +532,66 @@ def barlow_twins(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Ten
 
     return out
 
+
 @torch.no_grad()
-def _ressl_dequeue_and_enqueue(self, keys):
-    ptr = int(self.queue_ptr.item())
+def _ressl_dequeue_and_enqueue(module, keys):
+    ptr = int(module.queue_ptr.item())
     batch_size = keys.shape[0]
-    size = self.queue.shape[0]
+    size = module.queue.shape[0]
+    if size % batch_size != 0:
+        raise ValueError("Queue size must be divisible by batch size")
+    module.queue[ptr:ptr + batch_size].copy_(keys.detach())
+    module.queue_ptr[0] = (ptr + batch_size) % size
 
-    assert size % batch_size == 0
-
-    self.queue[ptr:ptr + batch_size] = keys.detach()
-    self.queue_ptr[0] = (ptr + batch_size) % size
 
 def ressl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
-    """Forward function for ReSSL.
-
-    ReSSL learns representations by matching student and teacher relational
-    distributions over a queue of previous teacher projections.
-
-    Args:
-        self: Module instance with required attributes:
-            - backbone: TeacherStudentWrapper for feature extraction.
-            - projector: TeacherStudentWrapper for projection embeddings.
-            - ressl_loss: ReSSLLoss for relational cross-entropy.
-            - queue: Buffer containing previous teacher projections.
-            - queue_ptr: Buffer tracking the circular queue position.
-        batch: Batch containing weak and strong augmented views during
-            training, or a single image during validation and testing.
-        stage: Training stage ("train", "val", or "test").
-
-    Returns:
-        Dictionary containing:
-            - "embedding": Student backbone representation.
-            - "loss": ReSSL loss during training only.
-            - "label": Ground-truth labels, if present.
-    """
+    """Match student/teacher relational distributions over a teacher queue."""
     out = {}
     views = _get_views_list(batch)
 
-    if views is not None:
-        if len(views) != 2:
-            raise ValueError(
-                f"ReSSL requires exactly 2 views, got {len(views)}."
-            )
-
-        weak_view = views[0]["image"]
-        strong_view = views[1]["image"]
-
-        if "label" in views[0]:
-            out["label"] = views[0]["label"]
-
-        # Student backbone: strong augmentation
-        student_features = self.backbone.forward_student(strong_view)
-        out["embedding"] = student_features.detach()
-
-        if stage not in ("train", "fit"):
-            return out
-
-        # Teacher branch: weak augmentation
-        with torch.no_grad():
-            # Shuffle teacher images before SplitBatchNorm
-            idx_shuffle = torch.randperm(
-                weak_view.shape[0],
-                device=weak_view.device,
-            )
-            idx_unshuffle = torch.argsort(idx_shuffle)
-
-            shuffled_weak_view = weak_view[idx_shuffle]
-
-            teacher_features = self.backbone.forward_teacher(
-                shuffled_weak_view
-            )
-            teacher_projection = self.projector.forward_teacher(
-                teacher_features
-            )
-            teacher_projection = torch.nn.functional.normalize(
-                teacher_projection,
-                dim=-1,
-            )
-
-            # Restore original order before calculating loss
-            teacher_projection = teacher_projection[idx_unshuffle]
-
-        # Student branch: strong augmentation
-        student_projection = self.projector.forward_student(
-            student_features
-        )
-        student_projection = torch.nn.functional.normalize(
-            student_projection, dim=-1
-        )
-
-        # Clone the queue to prevent in-place modification errors
-        # during backward propagation.
-        queue = self.queue.detach().clone()
-
-        # Compute relational cross-entropy loss.
-        out["loss"] = self.ressl_loss(
-            student_projection,
-            teacher_projection,
-            queue,
-        )
-
-        # Update the queue with the current teacher projections.
-        _ressl_dequeue_and_enqueue(
-            self,
-            teacher_projection.detach(),
-        )
-
-        self.log(
-            f"{stage}/loss",
-            out["loss"],
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-            prog_bar=True,
-        )
-
-    else:
-        # Single-view validation
-        images = batch["image"]
-
+    if views is None:
+        # Validation/test: evaluate the frozen representation, not the SSL loss.
         if "label" in batch:
             out["label"] = batch["label"]
-
         with torch.no_grad():
-            student_features = self.backbone.forward_student(images)
+            features = self.backbone.forward_student(batch["image"])
+        out["embedding"] = features.detach()
+        return out
 
-        out["embedding"] = student_features.detach()
+    if len(views) != 2:
+        raise ValueError(f"ReSSL requires two views, got {len(views)}")
 
+    weak_view = views[0]["image"]
+    strong_view = views[1]["image"]
+    if "label" in views[0]:
+        out["label"] = views[0]["label"]
+
+    student_features = self.backbone.forward_student(strong_view)
+    out["embedding"] = student_features.detach()
+    if stage not in ("fit", "train"):
+        return out
+
+    # Teacher sees the weak view; shuffle the batch for SplitBatchNorm.
+    with torch.no_grad():
+        shuffle = torch.randperm(weak_view.shape[0], device=weak_view.device)
+        unshuffle = torch.argsort(shuffle)
+        teacher_features = self.backbone.forward_teacher(weak_view[shuffle])
+        teacher_projection = self.projector.forward_teacher(teacher_features)
+        teacher_projection = torch.nn.functional.normalize(teacher_projection, dim=-1)[unshuffle]
+
+    student_projection = self.projector.forward_student(student_features)
+    student_projection = torch.nn.functional.normalize(student_projection, dim=-1)
+
+    # The clone protects autograd from the subsequent in-place queue update.
+    queue_snapshot = self.queue.detach().clone()
+    out["loss"] = self.ressl_loss(
+        student_projection, teacher_projection, queue_snapshot,
+    )
+    _ressl_dequeue_and_enqueue(self, teacher_projection)
+    self.log(
+        f"{stage}/loss", out["loss"], on_step=True,
+        on_epoch=True, sync_dist=True, prog_bar=True,
+    )
     return out
 
 def swav(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
