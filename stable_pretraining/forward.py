@@ -42,7 +42,7 @@ from typing import Any
 import torch
 
 from .callbacks.queue import find_or_create_queue_callback, OnlineQueue
-
+from stable_pretraining.methods.ressl import gather_teacher_keys
 
 def _get_views_list(batch: dict):
     """Convert multi-view batch to list of views."""
@@ -532,18 +532,6 @@ def barlow_twins(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Ten
 
     return out
 
-
-@torch.no_grad()
-def _ressl_dequeue_and_enqueue(module, keys):
-    ptr = int(module.queue_ptr.item())
-    batch_size = keys.shape[0]
-    size = module.queue.shape[0]
-    if size % batch_size != 0:
-        raise ValueError("Queue size must be divisible by batch size")
-    module.queue[ptr:ptr + batch_size].copy_(keys.detach())
-    module.queue_ptr[0] = (ptr + batch_size) % size
-
-
 def ressl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
     """Match student/teacher relational distributions over a teacher queue."""
     out = {}
@@ -568,7 +556,7 @@ def ressl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
 
     student_features = self.backbone.forward_student(strong_view)
     out["embedding"] = student_features.detach()
-    if stage not in ("fit", "train"):
+    if not self.training:
         return out
 
     # Teacher sees the weak view; shuffle the batch for SplitBatchNorm.
@@ -577,17 +565,22 @@ def ressl(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
         unshuffle = torch.argsort(shuffle)
         teacher_features = self.backbone.forward_teacher(weak_view[shuffle])
         teacher_projection = self.projector.forward_teacher(teacher_features)
-        teacher_projection = torch.nn.functional.normalize(teacher_projection, dim=-1)[unshuffle]
+        teacher_projection = torch.nn.functional.normalize(
+            teacher_projection, dim=-1
+        )[unshuffle]
 
     student_projection = self.projector.forward_student(student_features)
     student_projection = torch.nn.functional.normalize(student_projection, dim=-1)
 
     # The clone protects autograd from the subsequent in-place queue update.
-    queue_snapshot = self.queue.detach().clone()
+    queue_snapshot = self.queue.get().detach().clone()
     out["loss"] = self.ressl_loss(
         student_projection, teacher_projection, queue_snapshot,
     )
-    _ressl_dequeue_and_enqueue(self, teacher_projection)
+    with torch.no_grad():
+        keys = gather_teacher_keys(teacher_projection.detach())
+        self.queue.append(keys)
+
     self.log(
         f"{stage}/loss", out["loss"], on_step=True,
         on_epoch=True, sync_dist=True, prog_bar=True,

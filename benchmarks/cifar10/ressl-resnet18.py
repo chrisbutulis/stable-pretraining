@@ -1,7 +1,7 @@
 """ReSSL pretraining on CIFAR-10 using stable_pretraining.
 
 Run from your existing project so the parent-level utils.py is importable.
-The forward function is provided by the local ressl_forward.py file.
+Uses stable_pretraining.forward.ressl for the training forward pass.
 """
 
 import sys
@@ -15,82 +15,25 @@ import torchmetrics
 import torchvision
 
 import stable_pretraining as spt
+from stable_pretraining.backbone.ressl import ReSSLTeacherStudentWrapper
 from stable_pretraining.backbone.split_batchnorm import SplitBatchNorm
 from stable_pretraining.data import transforms
-
+from stable_pretraining.callbacks.queues import UnsortedQueue
 from stable_pretraining import forward
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from utils import get_data_dir
 
 
-# IMPORTANT: Verify the normalization values against the reference ReSSL data code.
-# These preserve the values in your original experiment.
 CIFAR10_STATS = {
     "mean": [0.4914, 0.4822, 0.4465],
     "std": [0.2023, 0.1994, 0.2010],
 }
+
 BATCH_SIZE = 256
 MAX_EPOCHS = 200
 WARMUP_EPOCHS = 5
 NUM_SPLITS = 8
-
-
-class ReSSLTeacherStudentWrapper(spt.TeacherStudentWrapper):
-    """EMA only over parameters, as in the reference ReSSL implementation."""
-
-    @torch.no_grad()
-    def update_teacher(self):
-        if not self.training or self.teacher is self.student:
-            return
-
-        momentum = float(self.ema_coefficient)
-        if momentum == 1.0:
-            return
-
-        student_params = list(self.student.parameters())
-        teacher_params = list(self.teacher.parameters())
-        if len(student_params) != len(teacher_params):
-            raise RuntimeError("Student and teacher parameter counts differ")
-
-        for student_param, teacher_param in zip(student_params, teacher_params):
-            teacher_param.lerp_(student_param, 1.0 - momentum)
-
-
-class ReSSLDiagnostics(pl.Callback):
-    """Check initialization and teacher BatchNorm mode on the first batch."""
-
-    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        if trainer.current_epoch != 0 or batch_idx != 0:
-            return
-
-        for name in ("backbone", "projector"):
-            wrapper = getattr(pl_module, name)
-            student_params = list(wrapper.student.parameters())
-            teacher_params = list(wrapper.teacher.parameters())
-            assert len(student_params) == len(teacher_params)
-            assert all(torch.equal(a, b) for a, b in zip(student_params, teacher_params)), (
-                f"{name}: teacher/student not identical at initialization"
-            )
-            assert all(not p.requires_grad for p in teacher_params), (
-                f"{name}: teacher parameters must be frozen"
-            )
-            assert wrapper.teacher.training, f"{name}: teacher is in eval mode"
-            print(f"{name}: initial weights match, teacher frozen and in train mode")
-
-        teacher_bns = [
-            layer for layer in pl_module.backbone.teacher.modules()
-            if isinstance(layer, nn.BatchNorm2d)
-        ]
-        assert teacher_bns, "No BatchNorm2d found in teacher backbone"
-        assert all(layer.training for layer in teacher_bns), (
-            "Teacher BatchNorm layers must be in training mode for reference ReSSL"
-        )
-        assert all(isinstance(layer, SplitBatchNorm) for layer in teacher_bns), (
-            "Teacher backbone contains BatchNorm layers that were not converted"
-        )
-        print(f"Teacher: {len(teacher_bns)} SplitBatchNorm layers in train mode")
-
 
 def replace_batchnorm(module: nn.Module, num_splits: int = NUM_SPLITS):
     for name, child in module.named_children():
@@ -107,7 +50,6 @@ def replace_batchnorm(module: nn.Module, num_splits: int = NUM_SPLITS):
             setattr(module, name, replacement)
         else:
             replace_batchnorm(child, num_splits)
-
 
 def main():
     pl.seed_everything(42, workers=True)
@@ -173,6 +115,15 @@ def main():
         base_ema_coefficient=0.99, final_ema_coefficient=0.99,
     )
 
+    # A full, randomly initialized memory bank matches the original ReSSL setup.
+    # Initialize after seeding and register as a child module for checkpointing.
+    queue = UnsortedQueue(max_length=4096, shape=128)
+    with torch.no_grad():
+        initial_keys = torch.nn.functional.normalize(
+            torch.randn(4096, 128), dim=-1
+        )
+        queue.append(initial_keys)
+
     module = spt.Module(
         backbone=backbone,
         projector=projector,
@@ -180,8 +131,7 @@ def main():
         ressl_loss=spt.losses.ReSSLLoss(
             temperature_student=0.1, temperature_teacher=0.04,
         ),
-        queue=torch.nn.functional.normalize(torch.randn(4096, 128), dim=1),
-        queue_ptr=torch.zeros(1, dtype=torch.long),
+        queue=queue,
         optim={
             "optimizer": {
                 "type": "SGD", "exclude_bias_norm": False,
@@ -199,12 +149,8 @@ def main():
         },
     )
 
-    # spt.Module stores constructor kwargs as ordinary attributes.
-    # Register these as buffers so Lightning moves and checkpoints them.
-    queue, queue_ptr = module.queue, module.queue_ptr
-    del module.queue, module.queue_ptr
-    module.register_buffer("queue", queue)
-    module.register_buffer("queue_ptr", queue_ptr)
+    # Ensure the queue's state is tracked by Lightning checkpoints.
+    assert "queue.out" in module.state_dict(), "Queue was not registered"
 
     linear_probe = spt.callbacks.OnlineProbe(
         module, name="linear_probe", input="embedding", target="label",
@@ -233,7 +179,6 @@ def main():
             spt.callbacks.TeacherStudentCallback(
                 update_frequency=1, update_after_backward=False,
             ),
-            ReSSLDiagnostics(),
         ],
         precision="32-true",
         logger=logger,

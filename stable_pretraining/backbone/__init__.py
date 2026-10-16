@@ -76,6 +76,10 @@ from .split_batchnorm import (
     SplitBatchNorm,
 )
 
+from .ressl import (
+    ReSSLTeacherStudentWrapper,
+)
+
 from .aggregator import TensorAggregator
 from .decoders import CNNImageDecoder, ViTImageDecoder, build_image_decoder
 from . import video  # noqa: F401  — video encoders live under sp.backbone.video.*
@@ -101,6 +105,7 @@ __all__ = [
     MultiHeadAttentiveProbe,
     LinearProbe,
     SplitBatchNorm,
+    ReSSLTeacherStudentWrapper,
     AutoLinearClassifier,
     EfficientMaskedTimmViT,
     register_lr_scale_hook,
