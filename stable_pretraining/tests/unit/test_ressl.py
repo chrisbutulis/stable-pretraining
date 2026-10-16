@@ -14,7 +14,8 @@ from torch.nn import functional as F
 from stable_pretraining.backbone.ressl import ReSSLTeacherStudentWrapper
 from stable_pretraining.callbacks.queues import UnsortedQueue
 from stable_pretraining.losses import ReSSLLoss
-from stable_pretraining.methods.ressl import gather_teacher_keys
+from stable_pretraining.methods import ReSSL
+from stable_pretraining.utils.ressl import gather_teacher_keys
 
 pytestmark = pytest.mark.unit
 
@@ -78,6 +79,41 @@ def test_ressl_parameter_only_ema_does_not_copy_batchnorm_buffers():
         torch.testing.assert_close(param, torch.full_like(param, 0.1))
     torch.testing.assert_close(
         wrapper.teacher[1].running_mean, torch.full((4,), 7.0)
+    )
+
+
+def test_ressl_standalone_forward():
+    class TinyEncoder(nn.Module):
+        num_features = 8
+
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(4, 8),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+    model = ReSSL(
+        encoder_name=TinyEncoder(),
+        queue_size=16,
+    )
+    model.train()
+
+    weak = torch.randn(4, 1, 2, 2)
+    strong = torch.randn(4, 1, 2, 2)
+
+    output = model(weak, strong)
+
+    assert output.loss.ndim == 0
+    assert torch.isfinite(output.loss)
+
+    output.loss.backward()
+    assert any(
+        p.grad is not None
+        for p in model.backbone.student.parameters()
     )
 
 
