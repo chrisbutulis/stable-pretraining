@@ -1,27 +1,30 @@
-"""ReSSL Loss.
 
-This module contains losses for ___________:
+"""Relational self-supervised learning losses.
 
-Reference: __________
+This module contains the ReSSL loss, which learns representations by
+matching student and teacher similarity distributions over a memory queue.
 """
 
 import torch
 import torch.nn.functional as F
 
+
 class ReSSLLoss(torch.nn.Module):
-    """Relational self-supervised learning loss.
+    """Relational Self-Supervised Learning (ReSSL) loss.
 
-    Computes cross-entropy between teacher and student relational
-    distributions after temperature scaling.
+    Computes cross-entropy between the student and teacher similarity
+    distributions over a shared memory queue of teacher projections.
 
-    The teacher distribution is treated as a fixed target, while the
-    student distribution is optimized to match it.
+    The teacher distribution serves as a fixed target, while the student
+    distribution is optimized to match it. Separate temperatures control
+    the sharpness of the two distributions.
 
     Args:
-        temperature_student (float): Temperature for the student relational
-            distribution.
-        temperature_teacher (float): Temperature for the teacher relational
-            distribution.
+        temperature_student: Temperature for the student distribution.
+        temperature_teacher: Temperature for the teacher distribution.
+
+    Raises:
+        ValueError: If either temperature is not strictly positive.
     """
 
     def __init__(
@@ -30,6 +33,10 @@ class ReSSLLoss(torch.nn.Module):
         temperature_teacher: float = 0.05,
     ):
         super().__init__()
+
+        if temperature_student <= 0 or temperature_teacher <= 0:
+            raise ValueError("ReSSL temperatures must be strictly positive")
+
         self.temperature_student = temperature_student
         self.temperature_teacher = temperature_teacher
 
@@ -39,32 +46,39 @@ class ReSSLLoss(torch.nn.Module):
         teacher_embeddings: torch.Tensor,
         queue: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the ReSSL relational cross-entropy loss.
+        """Compute relational cross-entropy between student and teacher.
 
         Args:
-            student_embeddings: Student relational similarity logits.
-            teacher_embeddings: Teacher relational similarity logits.
+            student_embeddings: Student projections of shape (B, D).
+            teacher_embeddings: Teacher projections of shape (B, D).
+            queue: Memory queue of teacher projections of shape (K, D).
 
         Returns:
             Scalar cross-entropy loss averaged over the batch.
 
         Shape:
-            - student_embeddings: (B, K), where B is the batch size and K is
-              the queue size.
-            - teacher_embeddings: (B, K), where B is the batch size and K is
-              the queue size.
-            - output: scalar.
+            - student_embeddings: (B, D)
+            - teacher_embeddings: (B, D)
+            - queue: (K, D)
+            - output: scalar
+
+        Notes:
+            B is the batch size, D is the projection dimension, and K
+            is the queue size. Embeddings and queue entries are expected
+            to be L2-normalized before calling this function.
+
+            Gradients flow through the student distribution only.
         """
-        # Apply temperature-scaled log-softmax to student
         student_logits = student_embeddings @ queue.T
         student_log_probs = F.log_softmax(
-            student_logits.float() / self.temperature_student, dim=-1
+            student_logits.float() / self.temperature_student,
+            dim=-1,
         )
 
-        # Apply temperature-scaled softmax to teacher
-        teacher_logits = teacher_embeddings @ queue.T
+        teacher_logits = teacher_embeddings.detach() @ queue.T
         teacher_probs = F.softmax(
-            teacher_logits.detach().float() / self.temperature_teacher, dim=-1
+            teacher_logits.float() / self.temperature_teacher,
+            dim=-1,
         )
 
-        return -torch.sum(teacher_probs * student_log_probs, dim=-1).mean()
+        return -(teacher_probs * student_log_probs).sum(dim=-1).mean()

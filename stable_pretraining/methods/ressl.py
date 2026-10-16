@@ -1,7 +1,8 @@
+
 """ReSSL: Relational Self-Supervised Learning.
 
-Student-teacher self-supervised learning with relational distributions over a
-queue of teacher projections.
+Student-teacher self-supervised learning with relational distributions over
+a memory queue of teacher projections.
 
 Reference:
     Zheng et al., "ReSSL: Relational Self-Supervised Learning with
@@ -12,8 +13,8 @@ from dataclasses import dataclass
 from typing import Union
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers.utils import ModelOutput
 
@@ -25,15 +26,38 @@ from stable_pretraining.losses import ReSSLLoss
 
 @dataclass
 class ReSSLOutput(ModelOutput):
-    """Structured output of the ReSSL method."""
+    """Output of the ReSSL forward pass.
+
+    Attributes:
+        loss: Scalar relational loss during training, or None during
+            evaluation.
+        student_embedding: Student backbone features of shape (N, D).
+        teacher_embedding: Teacher backbone features of shape (N, D),
+            or None during evaluation.
+    """
 
     loss: torch.Tensor = None
     student_embedding: torch.Tensor = None
     teacher_embedding: torch.Tensor = None
 
+
 @torch.no_grad()
 def gather_teacher_keys(keys: torch.Tensor) -> torch.Tensor:
-    """Gather teacher projections across distributed processes."""
+    """Gather teacher projections across distributed processes.
+
+    Concatenates teacher projections from all ranks so that each process
+    appends the same keys in the same order to its memory queue.
+
+    Args:
+        keys: Local teacher projections of shape (N, D).
+
+    Returns:
+        Gathered projections of shape (N * world_size, D), or the
+        original tensor when distributed training is inactive.
+
+    Notes:
+        All ranks must provide tensors of the same shape.
+    """
     if not dist.is_available() or not dist.is_initialized():
         return keys
 
@@ -43,15 +67,24 @@ def gather_teacher_keys(keys: torch.Tensor) -> torch.Tensor:
 
     gathered = [torch.empty_like(keys) for _ in range(world_size)]
     dist.all_gather(gathered, keys.contiguous())
+
     return torch.cat(gathered, dim=0)
+
 
 class ReSSL(Module):
     """Relational Self-Supervised Learning with an EMA teacher and memory queue.
 
+    The student learns to match the teacher's similarity distribution over
+    stored teacher projections. The teacher processes weak augmentations,
+    while the student processes strong augmentations.
+
+    Teacher parameters are updated separately through EMA, for example
+    by TeacherStudentCallback.
+
     Args:
-        encoder_name: Timm backbone name or an instantiated PyTorch backbone.
-        encoder_dim: Output feature dimension of the backbone. Inferred from
-            num_features when available.
+        encoder_name: Timm backbone name or instantiated PyTorch backbone.
+        encoder_dim: Backbone feature dimension. Inferred from num_features
+            when available.
         temperature_teacher: Teacher similarity-distribution temperature.
         temperature_student: Student similarity-distribution temperature.
         queue_size: Number of teacher projections retained in the queue.
@@ -72,6 +105,7 @@ class ReSSL(Module):
         pretrained: bool = False,
     ):
         super().__init__()
+
         if queue_size <= 0:
             raise ValueError("queue_size must be positive")
 
@@ -89,14 +123,11 @@ class ReSSL(Module):
         if encoder_dim is None:
             encoder_dim = getattr(base, "num_features", None)
 
-        if encoder_dim is None:
-            raise ValueError(
-                "encoder_dim must be provided when the backbone "
-                "does not expose num_features."
-            )
-
         if not isinstance(encoder_dim, int) or encoder_dim <= 0:
-            raise ValueError("encoder_dim must be a positive integer")
+            raise ValueError(
+                "encoder_dim must be a positive integer. Provide it "
+                "explicitly if the backbone has no num_features attribute."
+            )
 
         self.temperature_teacher = temperature_teacher
         self.temperature_student = temperature_student
@@ -107,6 +138,7 @@ class ReSSL(Module):
             base_ema_coefficient=ema_decay_start,
             final_ema_coefficient=ema_decay_end,
         )
+
         self.projection_head = ReSSLTeacherStudentWrapper(
             nn.Sequential(
                 nn.Linear(encoder_dim, 4096),
@@ -118,12 +150,16 @@ class ReSSL(Module):
             final_ema_coefficient=ema_decay_end,
         )
 
+        # Initialize the queue with normalized random teacher keys.
         self.queue = UnsortedQueue(max_length=queue_size, shape=512)
         with torch.no_grad():
-            initial_keys = F.normalize(torch.randn(queue_size, 512), dim=-1)
+            initial_keys = F.normalize(
+                torch.randn(queue_size, 512),
+                dim=-1,
+            )
             self.queue.append(initial_keys)
 
-        self.loss = ReSSLLoss(
+        self.ressl_loss = ReSSLLoss(
             temperature_student=temperature_student,
             temperature_teacher=temperature_teacher,
         )
@@ -133,15 +169,42 @@ class ReSSL(Module):
         weak_augmentation: torch.Tensor,
         contrastive_augmentation: torch.Tensor,
     ) -> ReSSLOutput:
-        """Compute relational cross-entropy against the current teacher queue."""
-        student_h = self.backbone.forward_student(contrastive_augmentation)
+        """Compute ReSSL relational cross-entropy.
 
+        The teacher encodes weakly augmented images and the student encodes
+        strongly augmented images. Their normalized projections are
+        compared against the current memory queue.
+
+        During training, teacher projections are gathered across
+        distributed processes and appended after loss computation.
+
+        Args:
+            weak_augmentation: Teacher images of shape (N, C, H, W).
+            contrastive_augmentation: Student images of shape (N, C, H, W).
+
+        Returns:
+            ReSSLOutput containing the loss and backbone embeddings.
+            During evaluation, only student embeddings are returned.
+
+        Notes:
+            Teacher features are computed without gradients. The memory
+            queue is updated only during training, and EMA teacher
+            parameter updates are handled externally.
+        """
         if not self.training:
+            with torch.no_grad():
+                student_h = self.backbone.forward_student(
+                    contrastive_augmentation
+                )
             return ReSSLOutput(
                 loss=None,
                 student_embedding=student_h,
                 teacher_embedding=None,
             )
+
+        student_h = self.backbone.forward_student(
+            contrastive_augmentation
+        )
 
         with torch.no_grad():
             teacher_h = self.backbone.forward_teacher(weak_augmentation)
@@ -151,14 +214,18 @@ class ReSSL(Module):
         student_z = self.projection_head.forward_student(student_h)
         student_z = F.normalize(student_z, dim=-1)
 
-        # Clone because appending to the queue changes its storage in place.
+        # Clone to protect autograd from the subsequent in-place queue update.
         queue_snapshot = self.queue.get().detach().clone()
-        loss = self.loss(student_z, teacher_z, queue_snapshot)
 
-        if self.training:
-            with torch.no_grad():
-                keys = gather_teacher_keys(teacher_z.detach())
-                self.queue.append(keys)
+        loss = self.ressl_loss(
+            student_z,
+            teacher_z,
+            queue_snapshot,
+        )
+
+        with torch.no_grad():
+            keys = gather_teacher_keys(teacher_z.detach())
+            self.queue.append(keys)
 
         return ReSSLOutput(
             loss=loss,

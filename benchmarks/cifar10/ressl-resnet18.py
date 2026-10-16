@@ -1,7 +1,11 @@
 """ReSSL pretraining on CIFAR-10 using stable_pretraining.
 
-Run from your existing project so the parent-level utils.py is importable.
-Uses stable_pretraining.forward.ressl for the training forward pass.
+Trains a ResNet-18 with asymmetric augmentations, SplitBatchNorm, an EMA
+teacher, and a queue of teacher projections. Uses the composable
+``stable_pretraining.forward.ressl`` forward function and online linear/KNN
+probes to monitor representation quality during pretraining.
+
+Final frozen-backbone linear evaluation is performed separately.
 """
 
 import sys
@@ -30,12 +34,27 @@ CIFAR10_STATS = {
     "std": [0.2023, 0.1994, 0.2010],
 }
 
+NUM_DEVICES = 1
 BATCH_SIZE = 256
 MAX_EPOCHS = 200
 WARMUP_EPOCHS = 5
 NUM_SPLITS = 8
 
-def replace_batchnorm(module: nn.Module, num_splits: int = NUM_SPLITS):
+GLOBAL_BATCH_SIZE = BATCH_SIZE * NUM_DEVICES
+
+
+def replace_batchnorm(
+    module: nn.Module, num_splits: int = NUM_SPLITS
+) -> None:
+    """Recursively replace BatchNorm2d layers with SplitBatchNorm in place.
+
+    Preserve each layer's configuration and existing state while enabling
+    independent batch statistics across equally sized input splits.
+
+    Args:
+        module: Network whose BatchNorm2d layers will be replaced.
+        num_splits: Number of splits used during training.
+    """
     for name, child in module.named_children():
         if isinstance(child, nn.BatchNorm2d):
             replacement = SplitBatchNorm(
@@ -51,9 +70,13 @@ def replace_batchnorm(module: nn.Module, num_splits: int = NUM_SPLITS):
         else:
             replace_batchnorm(child, num_splits)
 
+
 def main():
     pl.seed_everything(42, workers=True)
 
+    # ReSSL uses asymmetric views: the teacher sees weak augmentations and
+    # the student sees strong augmentations. The ordering is required by
+    # forward.ressl (views[0] = weak; views[1] = strong).
     weak_transform = transforms.Compose(
         transforms.RandomResizedCrop((32, 32), scale=(0.2, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -86,18 +109,24 @@ def main():
         cifar_val, names=["image", "label"], transform=val_transform,
     )
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, num_workers=0,
+        train_dataset, batch_size=BATCH_SIZE, num_workers=4,
         drop_last=True, shuffle=True,
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=BATCH_SIZE, num_workers=0,
+        val_dataset, batch_size=BATCH_SIZE, num_workers=4,
     )
-    steps_per_epoch = len(train_loader)
+
+    # Schedule the warmup and cosine decay by optimizer step, accounting
+    # for the global batch size when training on multiple devices.
+    steps_per_epoch = len(train_dataset) // GLOBAL_BATCH_SIZE
     warmup_steps = WARMUP_EPOCHS * steps_per_epoch
     max_steps = MAX_EPOCHS * steps_per_epoch
     print(f"Steps/epoch: {steps_per_epoch}; warmup: {warmup_steps}; total: {max_steps}")
     data = spt.data.DataModule(train=train_loader, val=val_loader)
 
+    # Use a CIFAR-sized ResNet-18 without its classification head. Replace
+    # BatchNorm2d with SplitBatchNorm for the teacher's shuffled batches.
+    # Both backbone and projector maintain momentum-teacher copies.
     base = spt.backbone.from_torchvision("resnet18", low_resolution=True)
     base.fc = nn.Identity()
     replace_batchnorm(base)
@@ -124,6 +153,8 @@ def main():
         )
         queue.append(initial_keys)
 
+    # Scale the base learning rate with the global batch size. The teacher
+    # and student temperatures control the relational target distributions.
     module = spt.Module(
         backbone=backbone,
         projector=projector,
@@ -135,7 +166,7 @@ def main():
         optim={
             "optimizer": {
                 "type": "SGD", "exclude_bias_norm": False,
-                "momentum": 0.9, "lr": 0.06 * BATCH_SIZE / 256,
+                "momentum": 0.9, "lr": 0.06 * GLOBAL_BATCH_SIZE / 256,
                 "weight_decay": 5e-4,
             },
             "scheduler": {
@@ -152,6 +183,8 @@ def main():
     # Ensure the queue's state is tracked by Lightning checkpoints.
     assert "queue.out" in module.state_dict(), "Queue was not registered"
 
+    # Online probes track representation quality during pretraining; final
+    # linear evaluation uses a separate frozen-backbone training procedure.
     linear_probe = spt.callbacks.OnlineProbe(
         module, name="linear_probe", input="embedding", target="label",
         probe=nn.Linear(512, 10), loss=nn.CrossEntropyLoss(),
@@ -172,6 +205,9 @@ def main():
         name="ressl-resnet18", log_model=False,
     )
     trainer = pl.Trainer(
+        accelerator="gpu",
+        devices=NUM_DEVICES,
+        strategy="ddp",
         max_epochs=MAX_EPOCHS,
         num_sanity_val_steps=0,
         callbacks=[
