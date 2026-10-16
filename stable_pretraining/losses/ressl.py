@@ -69,6 +69,7 @@ class ReSSLLoss(torch.nn.Module):
 
             Gradients flow through the student distribution only.
         """
+        queue = queue.detach()
         student_logits = student_embeddings @ queue.T
         student_log_probs = F.log_softmax(
             student_logits.float() / self.temperature_student,

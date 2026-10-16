@@ -3,8 +3,12 @@
 Evaluate a frozen student or teacher backbone with a CIFAR-10 linear probe.
 
 Examples:
-    python eval_ressl.py --checkpoint /path/to/last.ckpt
-    python eval_ressl.py --checkpoint /path/to/last.ckpt --branch teacher
+    python benchmarks/cifar10/ressl-resnet18-lineareval.py \
+        --checkpoint /path/to/last.ckpt
+
+    python benchmarks/cifar10/ressl-resnet18-lineareval.py \
+        --checkpoint /path/to/last.ckpt \
+        --branch teacher
 """
 
 import argparse

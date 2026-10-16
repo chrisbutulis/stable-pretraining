@@ -130,6 +130,28 @@ def _distributed_queue_worker(rank: int, init_file: str) -> None:
         dist.destroy_process_group()
 
 
+def test_ressl_loss_does_not_backprop_to_queue():
+    loss_fn = ReSSLLoss()
+
+    student = F.normalize(
+        torch.randn(4, 8), dim=-1
+    ).detach().requires_grad_()
+
+    teacher = F.normalize(
+        torch.randn(4, 8), dim=-1
+    )
+
+    queue = F.normalize(
+        torch.randn(16, 8), dim=-1
+    ).detach().requires_grad_()
+
+    loss = loss_fn(student, teacher, queue)
+    loss.backward()
+
+    assert student.grad is not None
+    assert queue.grad is None
+
+
 @pytest.mark.skipif(
     not dist.is_available() or os.name == "nt",
     reason="Requires torch.distributed and POSIX file init",

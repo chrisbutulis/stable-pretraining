@@ -57,5 +57,5 @@ __all__ = [
     "NegativeCosineSimilarity",
     "VCRegLoss",
     # ReSSL
-    "ReSSL",
+    "ReSSLLoss",
 ]

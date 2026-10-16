@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.utils import ModelOutput
@@ -22,6 +21,7 @@ from stable_pretraining import Module
 from stable_pretraining.backbone.ressl import ReSSLTeacherStudentWrapper
 from stable_pretraining.callbacks.queues import UnsortedQueue
 from stable_pretraining.losses import ReSSLLoss
+from stable_pretraining.utils import gather_teacher_keys
 
 
 @dataclass
@@ -39,36 +39,6 @@ class ReSSLOutput(ModelOutput):
     loss: torch.Tensor = None
     student_embedding: torch.Tensor = None
     teacher_embedding: torch.Tensor = None
-
-
-@torch.no_grad()
-def gather_teacher_keys(keys: torch.Tensor) -> torch.Tensor:
-    """Gather teacher projections across distributed processes.
-
-    Concatenates teacher projections from all ranks so that each process
-    appends the same keys in the same order to its memory queue.
-
-    Args:
-        keys: Local teacher projections of shape (N, D).
-
-    Returns:
-        Gathered projections of shape (N * world_size, D), or the
-        original tensor when distributed training is inactive.
-
-    Notes:
-        All ranks must provide tensors of the same shape.
-    """
-    if not dist.is_available() or not dist.is_initialized():
-        return keys
-
-    world_size = dist.get_world_size()
-    if world_size == 1:
-        return keys
-
-    gathered = [torch.empty_like(keys) for _ in range(world_size)]
-    dist.all_gather(gathered, keys.contiguous())
-
-    return torch.cat(gathered, dim=0)
 
 
 class ReSSL(Module):
@@ -207,9 +177,19 @@ class ReSSL(Module):
         )
 
         with torch.no_grad():
-            teacher_h = self.backbone.forward_teacher(weak_augmentation)
+            shuffle = torch.randperm(
+                weak_augmentation.shape[0],
+                device=weak_augmentation.device,
+            )
+            unshuffle = torch.argsort(shuffle)
+
+            teacher_h = self.backbone.forward_teacher(
+                weak_augmentation[shuffle]
+            )
             teacher_z = self.projection_head.forward_teacher(teacher_h)
-            teacher_z = F.normalize(teacher_z, dim=-1)
+
+            teacher_h = teacher_h[unshuffle]
+            teacher_z = F.normalize(teacher_z, dim=-1)[unshuffle]
 
         student_z = self.projection_head.forward_student(student_h)
         student_z = F.normalize(student_z, dim=-1)

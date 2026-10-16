@@ -42,13 +42,12 @@ class SplitBatchNorm(nn.BatchNorm2d):
     """
 
     def __init__(self, num_features: int, num_splits: int = 8, **kwargs):
-        if not isinstance(num_splits, int) or isinstance(num_splits, bool) or num_splits <= 0:
+        if (
+            not isinstance(num_splits, int)
+            or isinstance(num_splits, bool)
+            or num_splits <= 0
+        ):
             raise ValueError("num_splits must be a positive integer")
-        if kwargs.get("affine", True) is not True:
-            raise ValueError("SplitBatchNorm requires affine=True")
-        if kwargs.get("track_running_stats", True) is not True:
-            raise ValueError("SplitBatchNorm requires track_running_stats=True")
-
         super().__init__(num_features, **kwargs)
         self.num_splits = num_splits
 

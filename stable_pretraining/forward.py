@@ -42,7 +42,7 @@ from typing import Any
 import torch
 
 from .callbacks.queue import find_or_create_queue_callback, OnlineQueue
-from stable_pretraining.methods.ressl import gather_teacher_keys
+from stable_pretraining.utils import gather_teacher_keys
 
 def _get_views_list(batch: dict):
     """Convert multi-view batch to list of views."""
